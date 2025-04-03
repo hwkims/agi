@@ -1,0 +1,886 @@
+import fastapi
+import uvicorn
+from fastapi import WebSocket, WebSocketDisconnect, Response
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+import requests
+import edge_tts
+import asyncio
+import base64
+import os
+import time
+import json
+import uuid
+from pathlib import Path
+import threading
+
+# --- Configuration ---
+MODEL_NAME = "gemma3:4b"
+OLLAMA_API_URL = "http://localhost:11434/api/generate"
+PERSONA_NAME = "Aura"
+SYSTEM_CONTEXT = f"""You are {PERSONA_NAME}, a friendly and insightful AI assistant observing the world through a webcam.
+You have a slightly creative and expressive personality.
+Keep responses concise (1-3 sentences), conversational, and related to the image and user text.
+"""
+# TTS 목소리 변경 (JiMinNeural 시도)
+TTS_VOICE = "ko-KR-JiMinNeural"
+AUDIO_DIR = Path("static_audio")
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Frontend Code (Embedded - Glassmorphism Design) ---
+
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aura - AI Companion</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"> <!-- Font Awesome 아이콘 -->
+</head>
+<body>
+    <div class="background-overlay"></div> <!-- 배경 그라데이션용 -->
+    <div class="main-container">
+        <header>
+             <h1><i class="fa-solid fa-eye" style="margin-right: 10px;"></i> Aura <span class="beta">Beta</span></h1>
+             <p id="status-message" class="status-message">준비됨</p>
+        </header>
+
+        <div class="content-area">
+            <div class="glass-pane video-container">
+                <h2><i class="fa-solid fa-video" style="margin-right: 8px;"></i>Webcam</h2>
+                <div class="webcam-wrapper">
+                    <video id="webcam" autoplay playsinline muted></video>
+                </div>
+                <canvas id="canvas" style="display: none;"></canvas>
+                <div class="controls">
+                    <button id="connect-disconnect" class="control-button"><i class="fa-solid fa-power-off"></i> 서버 연결</button>
+                    <button id="start-stop-observe" class="control-button" disabled><i class="fa-solid fa-binoculars"></i> 관찰 시작</button>
+                </div>
+            </div>
+
+            <div class="glass-pane chat-container">
+                 <h2><i class="fa-solid fa-comments" style="margin-right: 8px;"></i>Chat</h2>
+                <div id="chatbox">
+                    <!-- Chat messages go here -->
+                </div>
+                <div class="input-area">
+                     <div id="stt-status" class="stt-status">음성 인식 준비됨</div>
+                     <div class="input-controls">
+                        <button id="start-stt" class="icon-button" title="듣기 시작" disabled><i class="fa-solid fa-microphone"></i></button>
+                        <button id="stop-stt" class="icon-button" title="듣기 중지" disabled style="display: none;"><i class="fa-solid fa-stop"></i></button>
+                        <input type="text" id="text-input" placeholder="Aura에게 메시지를 보내세요..." disabled>
+                        <button id="send-button" class="icon-button send-button" disabled title="전송"><i class="fa-solid fa-paper-plane"></i></button>
+                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <audio id="tts-audio" style="display: none;"></audio>
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
+"""
+
+# Glassmorphism CSS 적용
+CSS_CONTENT = """
+:root {
+    --background-start: #6a11cb;
+    --background-end: #2575fc;
+    --glass-bg: rgba(255, 255, 255, 0.1);
+    --glass-border: rgba(255, 255, 255, 0.18);
+    --text-color: #e0e0e0;
+    --text-darker: #333;
+    --primary-accent: #00aaff; /* 밝은 파란색 액센트 */
+    --user-msg-bg: rgba(0, 123, 255, 0.5); /* 반투명 파랑 */
+    --aura-msg-bg: rgba(233, 236, 239, 0.3); /* 반투명 밝은 회색 */
+    --system-msg-bg: rgba(108, 117, 125, 0.2); /* 반투명 회색 */
+    --border-radius: 16px;
+    --blur-amount: 10px;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'Noto Sans KR', sans-serif;
+    background: linear-gradient(135deg, var(--background-start), var(--background-end));
+    color: var(--text-color);
+    line-height: 1.6;
+    min-height: 100vh;
+    overflow-x: hidden; /* 가로 스크롤 방지 */
+    padding: 20px;
+}
+
+.background-overlay { /* 고정된 배경 효과 (선택적) */
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(135deg, var(--background-start), var(--background-end));
+    z-index: -1;
+}
+
+
+.main-container {
+    max-width: 1600px;
+    margin: 0 auto;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 30px;
+    padding: 15px;
+    background: rgba(0, 0, 0, 0.1);
+    border-radius: var(--border-radius);
+    color: #fff;
+}
+
+header h1 {
+    font-size: 2.2em;
+    font-weight: 700;
+    display: inline-flex; /* 아이콘과 정렬 */
+    align-items: center;
+    margin-bottom: 5px;
+}
+header h1 .beta {
+    font-size: 0.5em;
+    font-weight: 400;
+    color: var(--primary-accent);
+    margin-left: 10px;
+    vertical-align: super;
+}
+
+
+.status-message {
+    font-size: 0.9em;
+    color: #ccc; /* 밝은 회색 */
+    font-style: italic;
+}
+
+.content-area {
+    display: flex;
+    gap: 25px;
+    flex-wrap: wrap;
+}
+
+.glass-pane {
+    background: var(--glass-bg);
+    backdrop-filter: blur(var(--blur-amount));
+    -webkit-backdrop-filter: blur(var(--blur-amount)); /* Safari */
+    border-radius: var(--border-radius);
+    border: 1px solid var(--glass-border);
+    box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.2); /* 그림자 효과 */
+    padding: 25px;
+    flex: 1;
+    min-width: 450px;
+    display: flex;
+    flex-direction: column;
+    color: var(--text-color); /* 내부 기본 텍스트 색상 */
+}
+
+.glass-pane h2 {
+    color: #fff; /* 제목은 흰색 */
+    margin-bottom: 15px;
+    border-bottom: 1px solid var(--glass-border);
+    padding-bottom: 10px;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: center;
+}
+
+.webcam-wrapper {
+     position: relative;
+     width: 100%;
+     padding-top: 75%; /* 4:3 비율 (640x480) */
+     overflow: hidden;
+     border-radius: calc(var(--border-radius) - 8px); /* 내부 radius */
+     background-color: rgba(0, 0, 0, 0.3);
+     margin-bottom: 15px;
+}
+
+#webcam {
+     position: absolute;
+     top: 0;
+     left: 0;
+     width: 100%;
+     height: 100%;
+     object-fit: cover; /* 비율 유지하며 채우기 */
+     border: none;
+}
+
+.controls {
+    margin-top: auto; /* 아래쪽에 배치 */
+    padding-top: 15px;
+    display: flex;
+    gap: 15px;
+    justify-content: center;
+}
+
+.control-button {
+    background: rgba(255, 255, 255, 0.2);
+    color: var(--text-color);
+    border: 1px solid var(--glass-border);
+    padding: 10px 20px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.95em;
+    transition: background-color 0.3s ease, transform 0.1s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.control-button:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.3);
+    transform: translateY(-1px);
+}
+.control-button:active:not(:disabled) {
+     transform: translateY(0px);
+}
+
+
+.control-button:disabled {
+    background: rgba(204, 204, 204, 0.2);
+    border-color: rgba(204, 204, 204, 0.1);
+    color: rgba(224, 224, 224, 0.5);
+    cursor: not-allowed;
+}
+
+/* Chat Container Specifics */
+.chat-container {
+     justify-content: space-between;
+}
+
+#chatbox {
+    flex-grow: 1;
+    overflow-y: auto;
+    padding: 10px;
+    margin-bottom: 20px;
+    /* 스크롤바 스타일링 (선택적) */
+    scrollbar-width: thin;
+    scrollbar-color: var(--glass-border) transparent;
+}
+#chatbox::-webkit-scrollbar { width: 6px; }
+#chatbox::-webkit-scrollbar-track { background: transparent; }
+#chatbox::-webkit-scrollbar-thumb { background-color: var(--glass-border); border-radius: 6px; }
+
+
+.message {
+    margin-bottom: 12px;
+    padding: 10px 15px;
+    border-radius: var(--border-radius);
+    line-height: 1.5;
+    max-width: 85%;
+    word-wrap: break-word;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    color: var(--text-darker); /* 기본 메시지 텍스트는 어둡게 (가독성) */
+}
+
+.message.system {
+    background: var(--system-msg-bg);
+    font-style: italic;
+    color: #ccc; /* 시스템 메시지 텍스트 */
+    text-align: center;
+    max-width: 100%;
+    box-shadow: none;
+}
+
+.message.user {
+    background: var(--user-msg-bg);
+    color: #fff; /* 사용자 메시지 텍스트 */
+    margin-left: auto;
+    border-bottom-right-radius: 4px;
+}
+
+.message.aura {
+    background: var(--aura-msg-bg);
+    color: var(--text-darker); /* Aura 메시지 텍스트 */
+    margin-right: auto;
+    border-bottom-left-radius: 4px;
+}
+
+.input-area {
+     border-top: 1px solid var(--glass-border);
+     padding-top: 20px;
+     margin-top: auto; /* 항상 아래에 위치 */
+}
+
+.stt-status {
+    font-size: 0.85em;
+    color: #ccc;
+    margin-bottom: 12px;
+    min-height: 1.2em;
+    text-align: center;
+    transition: color 0.3s ease;
+}
+.stt-status:not(:empty) { /* 상태 메시지 있을 때만 보이도록 */
+     padding-bottom: 5px;
+}
+
+
+.input-controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.icon-button {
+    background: rgba(255, 255, 255, 0.2);
+    color: var(--text-color);
+    border: 1px solid var(--glass-border);
+    border-radius: 50%;
+    width: 44px;
+    height: 44px;
+    font-size: 18px;
+    padding: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    cursor: pointer;
+    transition: background-color 0.3s ease, transform 0.1s ease;
+}
+.icon-button:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.3);
+     transform: scale(1.05);
+}
+.icon-button:disabled {
+    background: rgba(204, 204, 204, 0.1);
+    border-color: rgba(204, 204, 204, 0.1);
+    color: rgba(224, 224, 224, 0.3);
+    cursor: not-allowed;
+}
+
+#text-input {
+    flex-grow: 1;
+    padding: 12px 20px; /* 패딩 증가 */
+    border: 1px solid var(--glass-border);
+    border-radius: 22px; /* 더 둥글게 */
+    background: rgba(0, 0, 0, 0.15); /* 약간 어두운 배경 */
+    color: var(--text-color);
+    font-size: 1em;
+    outline: none;
+    transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+#text-input::placeholder {
+     color: rgba(224, 224, 224, 0.6);
+}
+#text-input:focus {
+    border-color: rgba(0, 170, 255, 0.5); /* 포커스 시 액센트 색상 */
+    box-shadow: 0 0 0 3px rgba(0, 170, 255, 0.15);
+}
+#text-input:disabled {
+    background: rgba(204, 204, 204, 0.1);
+    cursor: not-allowed;
+}
+
+
+.send-button {
+    background-color: var(--primary-accent); /* 보내기 버튼 강조 */
+    color: white;
+}
+.send-button:hover:not(:disabled) {
+    background-color: #0095e0; /* 호버 시 약간 어둡게 */
+}
+"""
+
+# *** JavaScript 수정 부분 시작 (로직 변경 없음, 아이콘 버튼 표시/숨김 로직 추가) ***
+JAVASCRIPT_CONTENT = """
+document.addEventListener('DOMContentLoaded', () => {
+    // DOM 요소 가져오기
+    const webcamVideo = document.getElementById('webcam');
+    const canvas = document.getElementById('canvas');
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    const chatbox = document.getElementById('chatbox');
+    const textInput = document.getElementById('text-input');
+    const sendButton = document.getElementById('send-button');
+    const sttStatus = document.getElementById('stt-status');
+    const startSttButton = document.getElementById('start-stt');
+    const stopSttButton = document.getElementById('stop-stt');
+    const ttsAudio = document.getElementById('tts-audio');
+    const connectDisconnectButton = document.getElementById('connect-disconnect');
+    const observeButton = document.getElementById('start-stop-observe');
+    const statusMessage = document.getElementById('status-message');
+
+    // 상태 변수 초기화
+    let socket = null;
+    let mediaStream = null;
+    let observeInterval = null;
+    let latestFrameDataBase64 = null;
+    const OBSERVE_INTERVAL_MS = 5000;
+    let isConnected = false;
+    let isObserving = false;
+
+    // --- 상태 메시지 업데이트 함수 ---
+    function setStatusMessage(message) {
+        if (statusMessage) {
+            statusMessage.textContent = `${message}`; // "상태:" 제거
+        }
+        console.log(`Status: ${message}`);
+    }
+
+    // --- UI 요소 활성화/비활성화 함수 ---
+    function updateUIState() {
+        connectDisconnectButton.innerHTML = isConnected ? '<i class="fa-solid fa-plug-circle-xmark"></i> 연결 해제' : '<i class="fa-solid fa-power-off"></i> 서버 연결';
+        observeButton.disabled = !isConnected;
+        observeButton.innerHTML = isObserving ? '<i class="fa-solid fa-eye-slash"></i> 관찰 중지' : '<i class="fa-solid fa-binoculars"></i> 관찰 시작';
+
+        textInput.disabled = !isConnected;
+        sendButton.disabled = !isConnected;
+        startSttButton.disabled = !isConnected || isRecognizing; // 연결 상태이고 인식 중 아닐 때 활성화
+        stopSttButton.disabled = !isConnected || !isRecognizing; // 연결 상태이고 인식 중일 때 활성화
+        stopSttButton.style.display = isRecognizing ? 'flex' : 'none'; // 인식 중일 때만 보임
+        startSttButton.style.display = isRecognizing ? 'none' : 'flex'; // 인식 중 아닐 때만 보임
+
+        if (!isConnected) {
+            setStatusMessage("준비됨. '서버 연결' 버튼을 누르세요.");
+            sttStatus.textContent = "음성 인식 준비됨"; // 연결 끊기면 STT 상태 초기화
+        } else if (isObserving) {
+            setStatusMessage("연결됨 - 주기적으로 관찰 중...");
+        } else {
+            setStatusMessage("연결됨 - 대기 중.");
+        }
+    }
+
+
+    // --- WebSocket 통신 함수 ---
+    function connectWebSocket() {
+        if (socket) return;
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+        setStatusMessage("서버 연결 시도 중...");
+        connectDisconnectButton.disabled = true;
+
+        socket = new WebSocket(wsUrl);
+
+        socket.onopen = () => {
+            console.log("WebSocket connection established.");
+            isConnected = true;
+            connectDisconnectButton.disabled = false;
+            addMessage("System", "Aura와 연결되었습니다.");
+            updateUIState(); // 연결 성공 후 UI 즉시 업데이트
+            startWebcam(); // 웹캠 시작 시도
+        };
+
+        socket.onmessage = (event) => { // (변경 없음)
+            try {
+                const data = JSON.parse(event.data);
+                console.log("Message from server:", data);
+                if (data.type === "response") {
+                    addMessage("Aura", data.ai_text);
+                    if (data.audio_url) playTTS(data.audio_url);
+                } else if (data.type === "error") {
+                     addMessage("System", `서버 오류: ${data.message}`);
+                     setStatusMessage(`서버 오류: ${data.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to parse or handle server message:", error);
+                addMessage("System", "서버 메시지 처리 중 오류 발생");
+            }
+        };
+
+        socket.onerror = (error) => { // (변경 없음)
+            console.error("WebSocket error:", error);
+            addMessage("System", "WebSocket 오류 발생. 연결을 확인하세요.");
+            isConnected = false;
+            connectDisconnectButton.disabled = false;
+            stopWebcam();
+            stopObserveInterval();
+            updateUIState();
+            socket = null;
+        };
+
+        socket.onclose = (event) => { // (변경 없음)
+            console.log("WebSocket connection closed:", event.reason, `Code: ${event.code}`);
+            const wasConnected = isConnected;
+            isConnected = false;
+            connectDisconnectButton.disabled = false;
+            stopWebcam();
+            stopObserveInterval();
+            updateUIState();
+            socket = null;
+            if (wasConnected) {
+                 addMessage("System", "Aura와 연결이 종료되었습니다.");
+            }
+        };
+    }
+
+    function disconnectWebSocket() { // (변경 없음)
+        if (socket) {
+            setStatusMessage("연결 해제 중...");
+            socket.close();
+        }
+        stopWebcam();
+        stopObserveInterval();
+        updateUIState();
+    }
+
+    // --- 웹캠 처리 함수 ---
+    async function startWebcam() { // (상태 메시지 업데이트 개선)
+        if (mediaStream) return true;
+        setStatusMessage("웹캠 시작 중...");
+        try {
+             if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+             mediaStream = await navigator.mediaDevices.getUserMedia({
+                video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false
+             });
+            webcamVideo.srcObject = mediaStream;
+            await webcamVideo.play();
+
+            return new Promise((resolve) => {
+                webcamVideo.onloadedmetadata = () => {
+                     canvas.width = webcamVideo.videoWidth;
+                     canvas.height = webcamVideo.videoHeight;
+                     console.log(`Webcam started: ${canvas.width}x${canvas.height}`);
+                     // updateUIState에서 최종 상태 메시지 설정하므로 여기선 간단히 로깅만
+                     // setStatusMessage(isObserving ? "연결됨 - 주기적으로 관찰 중..." : "연결됨 - 대기 중.");
+                     resolve(true);
+                };
+                 webcamVideo.onerror = (e) => {
+                     console.error("Webcam video element error:", e);
+                     setStatusMessage("웹캠 비디오 표시 오류.");
+                     resolve(false);
+                 }
+            });
+        } catch (err) {
+            console.error("Error accessing webcam:", err);
+            let errorMsg = err.message;
+            if (err.name === "NotAllowedError") errorMsg = "웹캠 접근 권한이 거부되었습니다.";
+            else if (err.name === "NotFoundError") errorMsg = "연결된 웹캠을 찾을 수 없습니다.";
+            addMessage("System", `웹캠 접근 오류: ${errorMsg}.`);
+            setStatusMessage(`웹캠 오류: ${errorMsg}`);
+            updateUIState(); // 웹캠 실패 시 UI 상태 복구
+            return false;
+        }
+    }
+
+    function stopWebcam() { // (변경 없음)
+        if (mediaStream) {
+            mediaStream.getTracks().forEach(track => track.stop());
+            mediaStream = null;
+            webcamVideo.srcObject = null;
+            console.log("Webcam stopped.");
+        }
+    }
+
+    // --- 프레임 캡처 및 전송 함수 ---
+    function captureFrame() { // (변경 없음)
+        if (!mediaStream || !webcamVideo.videoWidth || webcamVideo.paused || webcamVideo.ended) {
+            console.warn("Webcam not ready for capture.");
+            latestFrameDataBase64 = null; return;
+        };
+        try {
+            context.drawImage(webcamVideo, 0, 0, canvas.width, canvas.height);
+            latestFrameDataBase64 = canvas.toDataURL('image/jpeg', 0.7);
+        } catch (e) { console.error("Error capturing frame:", e); latestFrameDataBase64 = null; }
+    }
+
+    async function sendFrameAndText(text = "") { // (변경 없음)
+        if (!isConnected || !socket || socket.readyState !== WebSocket.OPEN) {
+            addMessage("System", "서버에 연결되어 있지 않아 메시지를 보낼 수 없습니다.");
+            console.warn("Attempted to send data while disconnected."); return;
+        }
+        if (!mediaStream) {
+            const webcamStarted = await startWebcam();
+            if (!webcamStarted) {
+                 addMessage("System", "웹캠을 시작할 수 없어 이미지 없이 텍스트만 전송합니다.");
+                 latestFrameDataBase64 = null;
+            } else {
+                 await new Promise(resolve => setTimeout(resolve, 200)); captureFrame();
+            }
+        } else { captureFrame(); }
+
+        const payload = { image: latestFrameDataBase64, text: text };
+        try {
+            socket.send(JSON.stringify(payload));
+            console.log(`Sent data (text: ${text ? text.substring(0,20)+'...' : '[observe]'}, image: ${latestFrameDataBase64 ? 'Yes' : 'No'})`);
+        } catch (e) { console.error("Error sending data via WebSocket:", e); addMessage("System", "데이터 전송 중 오류 발생."); }
+    }
+
+    // --- 주기적 관찰 제어 ---
+    function startObserveInterval() { // (UI 업데이트 로직 개선)
+        if (observeInterval || !isConnected) return;
+        console.log("Starting observe interval...");
+        isObserving = true;
+        updateUIState(); // UI 상태 업데이트 (버튼 텍스트, 상태 메시지)
+        setTimeout(() => { if (isObserving) sendFrameAndText(""); }, 500);
+        observeInterval = setInterval(() => {
+            if (isObserving && isConnected) sendFrameAndText("");
+            else stopObserveInterval();
+        }, OBSERVE_INTERVAL_MS);
+    }
+
+    function stopObserveInterval() { // (UI 업데이트 로직 개선)
+        if (observeInterval) {
+            clearInterval(observeInterval);
+            observeInterval = null;
+            console.log("Observe interval stopped.");
+        }
+        isObserving = false; // 플래그 업데이트가 중요
+        if (isConnected) { // 연결 상태일 때만 UI 업데이트
+            updateUIState();
+        }
+    }
+
+    // --- 채팅 및 TTS 함수 (변경 없음) ---
+    function addMessage(sender, text) {
+        const messageElement = document.createElement('div');
+        messageElement.classList.add('message', sender.toLowerCase());
+        messageElement.innerHTML = `<strong>${sender}:</strong> ${text}`;
+        chatbox.appendChild(messageElement);
+        chatbox.scrollTop = chatbox.scrollHeight;
+    }
+    function playTTS(audioUrl) {
+        if (ttsAudio && audioUrl) {
+            ttsAudio.src = audioUrl;
+            ttsAudio.play().catch(e => { console.error("Audio playback error:", e); addMessage("System", "오디오 자동 재생에 실패했습니다."); });
+        }
+    }
+
+    // --- STT (Web Speech API) ---
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recognition = null;
+    let isRecognizing = false;
+
+    if (SpeechRecognition) {
+        recognition = new SpeechRecognition();
+        recognition.continuous = false; recognition.lang = 'ko-KR';
+        recognition.interimResults = false; recognition.maxAlternatives = 1;
+
+        recognition.onstart = () => {
+            isRecognizing = true; sttStatus.textContent = "듣고 있습니다...";
+            updateUIState(); // 버튼 상태 업데이트
+        };
+        recognition.onresult = (event) => {
+            const transcript = event.results[0][0].transcript;
+            sttStatus.textContent = `인식됨: ${transcript}`;
+            textInput.value = transcript;
+        };
+        recognition.onerror = (event) => {
+            console.error("Speech recognition error:", event.error, event.message);
+            let errorMsg = event.error;
+            if (event.error === 'no-speech') errorMsg = "음성이 감지되지 않았습니다.";
+            else if (event.error === 'audio-capture') errorMsg = "마이크 접근 오류.";
+            else if (event.error === 'not-allowed') errorMsg = "마이크 권한이 거부되었습니다.";
+            else errorMsg = event.message || event.error;
+             sttStatus.textContent = `음성 인식 오류: ${errorMsg}`;
+             // isRecognizing = false; // onend에서 처리
+        };
+        recognition.onend = () => {
+            isRecognizing = false;
+            if (sttStatus.textContent === "듣고 있습니다...") sttStatus.textContent = "음성 입력 종료됨.";
+            else if (!sttStatus.textContent.includes("오류")) sttStatus.textContent = "음성 인식 준비됨"; // 인식 성공 후
+            updateUIState(); // 버튼 상태 업데이트
+            console.log("Speech recognition ended.");
+        };
+    } else {
+        sttStatus.textContent = "음성 인식이 지원되지 않는 브라우저입니다.";
+        startSttButton.disabled = true; // STT 아예 비활성화
+    }
+
+    function startStt() { // (연결 확인 제거됨)
+        if (recognition && !isRecognizing) {
+            try { recognition.start(); }
+            catch(e) { console.error("STT start error:", e); sttStatus.textContent = "STT 시작 오류."; }
+        }
+    }
+    function stopStt() { // (변경 없음)
+        if (recognition && isRecognizing) {
+             try { recognition.stop(); }
+             catch(e) { console.error("STT stop error:", e); sttStatus.textContent = "STT 중지 오류."; isRecognizing = false; updateUIState(); }
+        }
+    }
+
+    // --- 사용자 입력 처리 함수 ---
+    async function sendUserInput() { // (변경 없음)
+        const text = textInput.value.trim();
+        if (text) {
+            addMessage("User", text);
+            await sendFrameAndText(text);
+            textInput.value = "";
+        } else {
+             addMessage("System", "(현재 장면을 살펴봐 달라고 요청합니다...)");
+             await sendFrameAndText("");
+        }
+        textInput.focus();
+    }
+
+    // --- 이벤트 리스너 설정 ---
+    connectDisconnectButton.addEventListener('click', () => { isConnected ? disconnectWebSocket() : connectWebSocket(); });
+    observeButton.addEventListener('click', () => { isObserving ? stopObserveInterval() : startObserveInterval(); });
+    sendButton.addEventListener('click', sendUserInput);
+    textInput.addEventListener('keypress', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendUserInput(); } });
+    startSttButton.addEventListener('click', startStt);
+    stopSttButton.addEventListener('click', stopStt);
+
+    // --- 초기화 ---
+    updateUIState(); // 초기 UI 상태 설정
+    addMessage("System", "'서버 연결' 버튼을 눌러 Aura를 활성화하세요.");
+    window.addEventListener('beforeunload', () => { disconnectWebSocket(); }); // 페이지 종료 시 정리
+});
+"""
+# *** JavaScript 수정 부분 끝 ***
+
+# --- FastAPI App Setup (변경 없음) ---
+app = fastapi.FastAPI()
+
+# --- Helper Functions (Temperature 조정 추가) ---
+async def generate_tts(text: str) -> str | None: # (변경 없음)
+    try:
+        output_filename = f"aura_tts_{uuid.uuid4()}.mp3"
+        output_path = AUDIO_DIR / output_filename
+        communicate = edge_tts.Communicate(text, TTS_VOICE)
+        await communicate.save(str(output_path))
+        audio_url = f"/static/audio/{output_filename}"
+        # print(f"TTS generated: {audio_url}") # 로그 간소화
+        asyncio.create_task(cleanup_old_audio_files(max_age_seconds=600))
+        return audio_url
+    except Exception as e:
+        print(f"Error generating TTS: {e}")
+        return None
+
+async def cleanup_old_audio_files(max_age_seconds: int): # (변경 없음)
+    try:
+        now = time.time()
+        removed_count = 0
+        for filename in os.listdir(AUDIO_DIR):
+            if filename.endswith(".mp3"):
+                file_path = AUDIO_DIR / filename
+                try:
+                    if now - file_path.stat().st_mtime > max_age_seconds:
+                        os.remove(file_path)
+                        removed_count += 1
+                except OSError as e: pass # 파일 삭제 오류는 무시
+        # if removed_count > 0: print(f"Cleaned up {removed_count} old audio file(s).") # 로그 간소화
+    except Exception as e: pass # 전체 정리 작업 오류 무시
+
+async def call_ollama_gemma3(image_base64: str | None, text: str, history: list) -> str:
+    """Ollama Gemma3 모델 API 호출 (generate 엔드포인트, temperature 조정)"""
+    full_prompt = SYSTEM_CONTEXT
+    for turn in history[-4:]:
+        role = turn.get('role', 'user')
+        full_prompt += f"<start_of_turn>{role}\n{turn['content']}<end_of_turn>\n"
+
+    user_content = text if text else "(Observing the scene)"
+    full_prompt += f"<start_of_turn>user\n{user_content}<end_of_turn>\n"
+    full_prompt += "<start_of_turn>model\n"
+
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": full_prompt,
+        "stream": False,
+        "options": {
+            "num_predict": 120, # 응답 길이 약간 증가
+            "temperature": 0.8, # Temperature 조정 (0.7 -> 0.8)
+            "stop": ["<end_of_turn>", "user:"] # 종료 토큰 추가
+        }
+    }
+    if image_base64:
+        try:
+            # Base64 문자열 데이터 부분만 추출
+            if "," in image_base64:
+                 image_base64_data = image_base64.split(",")[1]
+            else:
+                 image_base64_data = image_base64 # 이미 순수 데이터일 경우
+            payload["images"] = [image_base64_data]
+        except Exception as e:
+             print(f"Warning: Could not process image data: {e}. Sending text only.")
+             # 이미지 없이 진행
+
+    try:
+        # print(f"Sending prompt to Ollama (approx length: {len(full_prompt)})") # 로그 간소화
+        response = await asyncio.to_thread(
+            requests.post, OLLAMA_API_URL, json=payload, timeout=90
+        )
+        response.raise_for_status()
+        response_data = response.json()
+        ai_response = response_data.get("response", "").strip()
+
+        # 응답 후처리 (종료 토큰, 시작 마커 제거)
+        for stop_token in payload["options"]["stop"]:
+             if stop_token in ai_response:
+                 ai_response = ai_response.split(stop_token)[0].strip()
+        if ai_response.startswith("model\n"):
+            ai_response = ai_response[len("model\n"):].strip()
+
+        print(f"Ollama response: {ai_response}")
+        history.append({"role": "user", "content": user_content})
+        history.append({"role": "model", "content": ai_response}) # Gemma3는 'model' role 사용 가정
+
+        return ai_response if ai_response else "(Aura가 응답하지 않았어요.)" # 빈 응답 처리
+
+    except requests.exceptions.Timeout:
+        print("Ollama API call timed out.")
+        return "(응답 시간이 초과되었어요... ネットワーク接続を確認してください。)" # 네트워크 관련 메시지 추가
+    except requests.exceptions.RequestException as e:
+        print(f"Ollama API request error: {e}")
+        return f"(Ollama 서버 통신 오류: {e})"
+    except Exception as e:
+        print(f"Error processing Ollama response: {e}")
+        return "(응답 처리 중 예상치 못한 오류가 발생했어요.)"
+
+
+# --- WebSocket Connection Manager (변경 없음) ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+        self.history: dict[WebSocket, list] = {}
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept(); self.active_connections.append(websocket); self.history[websocket] = []
+        print(f"Client connected: {websocket.client}")
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections: self.active_connections.remove(websocket)
+        if websocket in self.history: del self.history[websocket]
+        print(f"Client disconnected: {websocket.client}")
+    async def send_json(self, message: dict, websocket: WebSocket):
+        if websocket in self.active_connections:
+             try: await websocket.send_json(message)
+             except Exception as e: print(f"Send failed to {websocket.client}: {e}"); self.disconnect(websocket)
+        # else: print(f"Attempted send to disconnected client: {websocket.client}") # 로그 간소화
+
+manager = ConnectionManager()
+
+# --- API Endpoints (변경 없음) ---
+@app.get("/static/css/style.css", response_class=Response)
+async def get_css(): return Response(content=CSS_CONTENT, media_type="text/css")
+@app.get("/static/js/main.js", response_class=Response)
+async def get_js(): return Response(content=JAVASCRIPT_CONTENT, media_type="application/javascript")
+@app.get("/", response_class=HTMLResponse)
+async def get_root(): return HTMLResponse(content=HTML_CONTENT)
+app.mount("/static/audio", StaticFiles(directory=AUDIO_DIR), name="static_audio")
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket): # (변경 없음)
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            image_base64 = data.get("image")
+            user_text = data.get("text", "")
+            current_history = manager.history.get(websocket, [])
+            ai_response_text = await call_ollama_gemma3(image_base64, user_text, current_history)
+            audio_url = await generate_tts(ai_response_text)
+            response_payload = {"type": "response", "ai_text": ai_response_text, "audio_url": audio_url}
+            await manager.send_json(response_payload, websocket)
+    except WebSocketDisconnect: manager.disconnect(websocket); print(f"Client {websocket.client} disconnected.")
+    except Exception as e:
+        print(f"WebSocket Error for {websocket.client}: {e}")
+        error_payload = {"type": "error", "message": f"Server processing error."}
+        await manager.send_json(error_payload, websocket); manager.disconnect(websocket)
+
+# --- Uvicorn 실행 (변경 없음) ---
+if __name__ == "__main__":
+    print("Starting FastAPI server with Glassmorphism UI...")
+    print(f"Audio files will be saved in: {AUDIO_DIR.resolve()}")
+    print("Access the application at http://localhost:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # For development: uvicorn main:app --reload
